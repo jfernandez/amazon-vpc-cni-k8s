@@ -49,6 +49,7 @@ const (
 
 type VirtualInterfaceMetadata struct {
 	IPAddress         *net.IPNet
+	IPv6Address       *net.IPNet // Secondary IPv6 address for dual-stack branch ENIs
 	DeviceNumber      int
 	RouteTable        int
 	HostVethName      string
@@ -325,27 +326,89 @@ func (n *linuxNetwork) SetupBranchENIPodNetwork(vethMetadata VirtualInterfaceMet
 		return errors.Wrapf(err, "SetupBranchENIPodNetwork: failed to setup veth pair")
 	}
 
+	// For dual-stack branch ENIs, enable IPv6 forwarding on hostVeth
+	// setupVeth sets forwarding=0 by default, but we need forwarding=1 for branch ENI IPv6 traffic
+	// to be forwarded from the hostVeth to the vlan interface
+	if vethMetadata.IPv6Address != nil {
+		if err := n.procSys.Set(fmt.Sprintf("net/ipv6/conf/%s/forwarding", vethMetadata.HostVethName), "1"); err != nil {
+			if !os.IsNotExist(err) {
+				return errors.Wrapf(err, "SetupBranchENIPodNetwork: failed to enable IPv6 forwarding on hostVeth %s", vethMetadata.HostVethName)
+			}
+			log.Debugf("Ignoring '%v' writing to forwarding: Assuming kernel lacks IPv6 support", err)
+		}
+		log.Debugf("SetupBranchENIPodNetwork: enabled IPv6 forwarding on hostVeth %s", vethMetadata.HostVethName)
+	}
+
 	// clean up any previous hostVeth ip rule recursively. (when pod with same name are recreated multiple times).
 	//
 	// per our understanding, previous we obtain vlanID from pod spec, it could be possible the vlanID is already updated when deleting old pod, thus the hostVeth been cleaned up during oldPod deletion is incorrect.
 	// now since we obtain vlanID from prevResult during pod deletion, we should be able to correctly purge hostVeth during pod deletion and thus don't need this logic.
 	// this logic is kept here for safety purpose.
-	oldFromHostVethRule := n.netLink.NewRule()
-	oldFromHostVethRule.IifName = vethMetadata.HostVethName
-	oldFromHostVethRule.Priority = networkutils.VlanRulePriority
-
-	// If IPv4 it returns the IP address back
-	if vethMetadata.IPAddress.IP.To4() == nil {
-		oldFromHostVethRule.Family = unix.AF_INET6
-	}
-	if err := networkutils.NetLinkRuleDelAll(n.netLink, oldFromHostVethRule); err != nil {
-		return errors.Wrapf(err, "SetupBranchENIPodNetwork: failed to delete hostVeth rule for %s", vethMetadata.HostVethName)
+	//
+	// For dual-stack support, we must explicitly delete rules for BOTH families.
+	// Using Family=0 (AF_UNSPEC) does not match rules with explicit Family=AF_INET or AF_INET6.
+	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
+		oldFromHostVethRule := n.netLink.NewRule()
+		oldFromHostVethRule.IifName = vethMetadata.HostVethName
+		oldFromHostVethRule.Priority = networkutils.VlanRulePriority
+		oldFromHostVethRule.Family = family
+		if err := networkutils.NetLinkRuleDelAll(n.netLink, oldFromHostVethRule); err != nil {
+			return errors.Wrapf(err, "SetupBranchENIPodNetwork: failed to delete hostVeth rule for %s (family=%d)", vethMetadata.HostVethName, family)
+		}
 	}
 
 	rtTable := vlanID + 100
 	vlanLink, err := n.setupVlan(vlanID, eniMAC, subnetGW, parentIfIndex, rtTable, log)
 	if err != nil {
 		return errors.Wrapf(err, "SetupBranchENIPodNetwork: failed to setup vlan")
+	}
+
+	// For dual-stack branch ENIs, add IPv6 routes to the vlan routing table
+	if vethMetadata.IPv6Address != nil {
+		ipv6Gw := networkutils.GetIPv6Gateway()
+		ipv6Routes := buildRoutesForVlan(rtTable, vlanLink.Attrs().Index, ipv6Gw)
+		for _, r := range ipv6Routes {
+			if err := n.netLink.RouteReplace(&r); err != nil {
+				return errors.Wrapf(err, "SetupBranchENIPodNetwork: failed to add IPv6 route %s via %s", r.Dst.IP.String(), ipv6Gw)
+			}
+		}
+		log.Debugf("SetupBranchENIPodNetwork: added IPv6 routes to vlan table %d via %s", rtTable, ipv6Gw)
+
+		// Add static neighbor entry for the IPv6 gateway (fe80:ec2::1) on the vlan interface
+		// This is required because the vlan interface needs to know the router MAC to send IPv6 traffic
+		// Look up the router MAC from the parent interface's neighbor table
+		parentLink, err := n.netLink.LinkByIndex(parentIfIndex)
+		if err != nil {
+			return errors.Wrapf(err, "SetupBranchENIPodNetwork: failed to get parent interface by index %d", parentIfIndex)
+		}
+		neighs, err := n.netLink.NeighList(parentIfIndex, unix.AF_INET6)
+		if err != nil {
+			return errors.Wrapf(err, "SetupBranchENIPodNetwork: failed to list IPv6 neighbors on parent interface %s", parentLink.Attrs().Name)
+		}
+		var routerMAC net.HardwareAddr
+		for _, neigh := range neighs {
+			if neigh.IP.Equal(ipv6Gw) {
+				routerMAC = neigh.HardwareAddr
+				break
+			}
+		}
+		if routerMAC == nil {
+			log.Warnf("SetupBranchENIPodNetwork: could not find neighbor entry for %s on parent interface %s, IPv6 may not work correctly", ipv6Gw, parentLink.Attrs().Name)
+		} else {
+			vlanNeigh := &netlink.Neigh{
+				LinkIndex:    vlanLink.Attrs().Index,
+				State:        netlink.NUD_PERMANENT,
+				IP:           ipv6Gw,
+				HardwareAddr: routerMAC,
+			}
+			if err := n.netLink.NeighAdd(vlanNeigh); err != nil && !os.IsExist(err) {
+				// Try NeighSet in case it already exists
+				if err := n.netLink.NeighSet(vlanNeigh); err != nil {
+					return errors.Wrapf(err, "SetupBranchENIPodNetwork: failed to add static neighbor for gateway %s on vlan", ipv6Gw)
+				}
+			}
+			log.Debugf("SetupBranchENIPodNetwork: added static neighbor for %s -> %s on vlan interface", ipv6Gw, routerMAC)
+		}
 	}
 
 	switch podSGEnforcingMode {
@@ -358,12 +421,32 @@ func (n *linuxNetwork) SetupBranchENIPodNetwork(vethMetadata VirtualInterfaceMet
 			return errors.Wrapf(err, "SetupBranchENIPodNetwork: unable to setup IP based container routes and rules")
 		}
 	}
+
+	// For dual-stack branch ENIs, add the secondary IPv6 address if present
+	if vethMetadata.IPv6Address != nil {
+		log.Debugf("SetupBranchENIPodNetwork: adding secondary IPv6 address %v", vethMetadata.IPv6Address)
+		if err := n.addSecondaryIPToContainer(netnsPath, vethMetadata.ContainerVethName, vethMetadata.IPv6Address, hostVeth.Attrs().HardwareAddr, log); err != nil {
+			return errors.Wrapf(err, "SetupBranchENIPodNetwork: failed to add secondary IPv6 address")
+		}
+		// Set up routes and rules for the secondary IPv6 address
+		switch podSGEnforcingMode {
+		case sgpp.EnforcingModeStrict:
+			if err := n.setupIIFBasedContainerRouteRules(hostVeth, vethMetadata.IPv6Address, vlanLink, rtTable, log); err != nil {
+				return errors.Wrapf(err, "SetupBranchENIPodNetwork: unable to setup IIF based container routes and rules for IPv6")
+			}
+		case sgpp.EnforcingModeStandard:
+			if err := n.setupIPBasedContainerRouteRules(hostVeth, vethMetadata.IPv6Address, rtTable, log); err != nil {
+				return errors.Wrapf(err, "SetupBranchENIPodNetwork: unable to setup IP based container routes and rules for IPv6")
+			}
+		}
+	}
+
 	return nil
 }
 
 // TeardownBranchENIPodNetwork tears down the vlan and corresponding ip rules.
 func (n *linuxNetwork) TeardownBranchENIPodNetwork(vethMetadata VirtualInterfaceMetadata, vlanID int, _ sgpp.EnforcingMode, log logger.Logger) error {
-	log.Debugf("TeardownBranchENIPodNetwork: containerAddr=%s, vlanID=%d", vethMetadata.IPAddress.String(), vlanID)
+	log.Debugf("TeardownBranchENIPodNetwork: containerAddr=%s, containerIPv6Addr=%v, vlanID=%d", vethMetadata.IPAddress.String(), vethMetadata.IPv6Address, vlanID)
 
 	if err := n.teardownVlan(vlanID, log); err != nil {
 		return errors.Wrapf(err, "TeardownBranchENIPodNetwork: failed to teardown vlan")
@@ -380,6 +463,17 @@ func (n *linuxNetwork) TeardownBranchENIPodNetwork(vethMetadata VirtualInterface
 	}
 	if err := n.teardownIPBasedContainerRouteRules(vethMetadata.IPAddress, rtTable, log); err != nil {
 		return errors.Wrapf(err, "TeardownBranchENIPodNetwork: unable to teardown IP based container routes and rules")
+	}
+
+	// For dual-stack branch ENIs, also clean up the secondary IPv6 address rules
+	if vethMetadata.IPv6Address != nil {
+		log.Debugf("TeardownBranchENIPodNetwork: cleaning up secondary IPv6 address %s", vethMetadata.IPv6Address.String())
+		if err := n.teardownIIFBasedContainerRouteRules(rtTable, unix.AF_INET6, log); err != nil {
+			return errors.Wrapf(err, "TeardownBranchENIPodNetwork: unable to teardown IIF based container routes and rules for IPv6")
+		}
+		if err := n.teardownIPBasedContainerRouteRules(vethMetadata.IPv6Address, rtTable, log); err != nil {
+			return errors.Wrapf(err, "TeardownBranchENIPodNetwork: unable to teardown IP based container routes and rules for IPv6")
+		}
 	}
 
 	return nil
@@ -650,6 +744,97 @@ func (n *linuxNetwork) teardownIIFBasedContainerRouteRules(rtTable int, family i
 	log.Debugf("Successfully deleted IIF based rules, rtTable=%v", rtTable)
 
 	return nil
+}
+
+// addSecondaryIPToContainer adds a secondary IP address (typically IPv6) to a container's veth interface.
+// This is used for dual-stack branch ENIs where IPv4 is the primary and IPv6 is the secondary address.
+func (n *linuxNetwork) addSecondaryIPToContainer(netnsPath string, contVethName string, ipAddr *net.IPNet, hostVethMAC net.HardwareAddr, log logger.Logger) error {
+	return n.ns.WithNetNSPath(netnsPath, func(_ ns.NetNS) error {
+		contVeth, err := n.netLink.LinkByName(contVethName)
+		if err != nil {
+			return errors.Wrapf(err, "failed to find container veth %s", contVethName)
+		}
+
+		// For IPv6, enable IPv6 on the interface if not already enabled
+		if ipAddr.IP.To4() == nil {
+			if err := n.procSys.Set(fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", contVethName), "0"); err != nil {
+				if !os.IsNotExist(err) {
+					return errors.Wrapf(err, "failed to enable IPv6 on container veth %s", contVethName)
+				}
+			}
+		}
+
+		// Add the secondary IP address to the container veth
+		addr := &netlink.Addr{IPNet: ipAddr}
+		if err := n.netLink.AddrAdd(contVeth, addr); err != nil {
+			return errors.Wrapf(err, "failed to add secondary IP %s to container veth %s", ipAddr.String(), contVethName)
+		}
+		log.Debugf("Successfully added secondary IP %s to container veth %s", ipAddr.String(), contVethName)
+
+		// Add a default route for the secondary address family
+		// For IPv6 on branch ENIs, use fe80:ec2::1 (GetIPv6Gateway) - this is the AWS VPC gateway
+		// For IPv4, use the standard pod gateway calculation
+		var gw net.IP
+		var maskLen int
+		var defNet *net.IPNet
+
+		if ipAddr.IP.To4() != nil {
+			gw = networkutils.CalculatePodIPv4GatewayIP(0)
+			maskLen = 32
+			defNet = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, maskLen)}
+		} else {
+			// For branch ENIs, use the AWS VPC IPv6 gateway (fe80:ec2::1)
+			gw = networkutils.GetIPv6Gateway()
+			maskLen = 128
+			defNet = &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, maskLen)}
+		}
+
+		gwNet := &net.IPNet{IP: gw, Mask: net.CIDRMask(maskLen, maskLen)}
+
+		// Add route to gateway
+		if err := n.netLink.RouteReplace(&netlink.Route{
+			LinkIndex: contVeth.Attrs().Index,
+			Scope:     netlink.SCOPE_LINK,
+			Dst:       gwNet,
+			Table:     unix.RT_TABLE_MAIN,
+		}); err != nil {
+			return errors.Wrapf(err, "failed to add gateway route for secondary IP %s", ipAddr.String())
+		}
+
+		// Add default route via gateway
+		if err := n.netLink.RouteReplace(&netlink.Route{
+			LinkIndex: contVeth.Attrs().Index,
+			Scope:     netlink.SCOPE_UNIVERSE,
+			Dst:       defNet,
+			Gw:        gw,
+			Table:     unix.RT_TABLE_MAIN,
+		}); err != nil {
+			return errors.Wrapf(err, "failed to add default route for secondary IP %s", ipAddr.String())
+		}
+
+		// Add static neighbor entry for the gateway
+		// This is required because the container uses routed mode and needs to resolve the gateway MAC
+		neigh := &netlink.Neigh{
+			LinkIndex:    contVeth.Attrs().Index,
+			State:        netlink.NUD_PERMANENT,
+			IP:           gw,
+			HardwareAddr: hostVethMAC,
+		}
+		if err := n.netLink.NeighAdd(neigh); err != nil {
+			return errors.Wrapf(err, "failed to add static neighbor entry for gateway %s", gw.String())
+		}
+		log.Debugf("Added static neighbor entry for gateway %s -> %s", gw.String(), hostVethMAC.String())
+
+		// For IPv6, wait for DAD (Duplicate Address Detection) to complete
+		if ipAddr.IP.To4() == nil {
+			if err := cniutils.WaitForAddressesToBeStable(n.netLink, contVethName, v6DADTimeout, WAIT_INTERVAL); err != nil {
+				return errors.Wrapf(err, "failed while waiting for secondary IPv6 address to be stable")
+			}
+		}
+
+		log.Debugf("Successfully configured secondary IP %s with routes in container", ipAddr.String())
+		return nil
+	})
 }
 
 // buildRoutesForVlan builds routes required for the vlan link.

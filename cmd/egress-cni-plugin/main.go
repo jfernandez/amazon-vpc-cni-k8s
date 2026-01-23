@@ -80,6 +80,18 @@ func add(args *skel.CmdArgs, ec *egressContext) (err error) {
 		return types.PrintResult(ec.Result, ec.NetConf.CNIVersion)
 	}
 
+	// For IPv6 clusters (NodeIP is IPv4), check if pod already has native IPv4.
+	// This handles dual-stack branch ENI pods that have both IPv4 and IPv6 addresses.
+	// These pods don't need egress-cni's NAT-based IPv4 egress since they have native IPv4.
+	if ec.NetConf.NodeIP != nil && ec.NetConf.NodeIP.To4() != nil {
+		for _, ipc := range ec.Result.IPs {
+			if ipc.Address.IP.To4() != nil && ipc.Address.IP.IsGlobalUnicast() {
+				ec.Log.Debugf("Pod already has native IPv4 address %s, skipping egress-cni", ipc.Address.IP)
+				return types.PrintResult(ec.Result, ec.NetConf.CNIVersion)
+			}
+		}
+	}
+
 	// Invoke ipam del if err to avoid ip leak
 	defer func() {
 		if err != nil {

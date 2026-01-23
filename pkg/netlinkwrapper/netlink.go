@@ -30,6 +30,8 @@ var log = logger.Get()
 type NetLink interface {
 	// LinkByName gets a link object given the device name
 	LinkByName(name string) (netlink.Link, error)
+	// LinkByIndex gets a link object given the device index
+	LinkByIndex(index int) (netlink.Link, error)
 	// LinkSetNsFd is equivalent to `ip link set $link netns $ns`
 	LinkSetNsFd(link netlink.Link, fd int) error
 	// ParseAddr parses an address string
@@ -58,6 +60,10 @@ type NetLink interface {
 	RouteDel(route *netlink.Route) error
 	// NeighAdd equivalent to: `ip neigh add ....`
 	NeighAdd(neigh *netlink.Neigh) error
+	// NeighSet is equivalent to: `ip neigh replace ....`
+	NeighSet(neigh *netlink.Neigh) error
+	// NeighList is equivalent to: `ip neigh show`
+	NeighList(linkIndex, family int) ([]netlink.Neigh, error)
 	// LinkDel equivalent to: `ip link del $link`
 	LinkDel(link netlink.Link) error
 	// NewRule creates a new empty rule
@@ -110,6 +116,10 @@ func (*netLink) LinkAdd(link netlink.Link) error {
 
 func (*netLink) LinkByName(name string) (netlink.Link, error) {
 	return netlink.LinkByName(name)
+}
+
+func (*netLink) LinkByIndex(index int) (netlink.Link, error) {
+	return netlink.LinkByIndex(index)
 }
 
 func (*netLink) LinkSetNsFd(link netlink.Link, fd int) error {
@@ -180,6 +190,20 @@ func (*netLink) AddrList(link netlink.Link, family int) ([]netlink.Addr, error) 
 
 func (*netLink) NeighAdd(neigh *netlink.Neigh) error {
 	return netlink.NeighAdd(neigh)
+}
+
+func (*netLink) NeighSet(neigh *netlink.Neigh) error {
+	return netlink.NeighSet(neigh)
+}
+
+func (*netLink) NeighList(linkIndex, family int) ([]netlink.Neigh, error) {
+	var neighs []netlink.Neigh
+	var err error
+	err = retryOnErrDumpInterrupted(func() error {
+		neighs, err = netlink.NeighList(linkIndex, family)
+		return err
+	})
+	return neighs, err
 }
 
 func (*netLink) LinkDel(link netlink.Link) error {
